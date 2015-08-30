@@ -670,10 +670,9 @@ class gate_struct64(obj.CType):
 
     @property
     def Address(self):
-
-        low = self.offset_low
+        low    = self.offset_low
         middle = self.offset_middle
-        high = self.offset_high
+        high   = self.offset_high
 
         ret = (high << 32) | (middle << 16) | low
 
@@ -683,7 +682,6 @@ class desc_struct(obj.CType):
 
     @property
     def Address(self):
-
         return (self.b & 0xffff0000) | (self.a & 0x0000ffff)
 
 class module_sect_attr(obj.CType):
@@ -799,7 +797,12 @@ class net_device(obj.CType):
             macaddr = ":".join(["{0:02x}".format(x) for x in hwaddr][:6])
         
         if macaddr == "00:00:00:00:00:00":
-            hwaddr = self.obj_vm.zread(self.dev_addr, 6)
+            if type(self.dev_addr) == volatility.obj.Pointer:
+                addr = self.dev_addr.v()
+            else:
+                addr = self.dev_addr.obj_offset
+    
+            hwaddr = self.obj_vm.zread(addr, 6)
             macaddr = ":".join(["{0:02x}".format(ord(x)) for x in hwaddr][:6])
                         
         return macaddr
@@ -899,6 +902,9 @@ class module_struct(obj.CType):
         return val
 
     def get_params(self):
+        if not hasattr(self, "kp"):
+            return ""
+
         params = ""
         param_array = obj.Object(theType = 'Array', offset = self.kp, vm = self.obj_vm, targetType = 'kernel_param', count = self.num_kp)
         
@@ -1050,11 +1056,11 @@ class vm_area_struct(obj.CType):
     def is_suspicious(self):
         ret = False        
 
-        flags_str  = self.flags()
+        flags_str  = self.protection()
        
         if flags_str == "VM_READ|VM_WRITE|VM_EXEC":
-           ret = True 
-
+            ret = True 
+            
         elif flags_str == "VM_READ|VM_EXEC" and not self.vm_file:
             ret = True
 
@@ -1207,19 +1213,9 @@ class task_struct(obj.CType):
             # test the number of buckets
             htable = obj.Object("_bash_hash_table", offset = off - nbuckets_offset, vm = proc_as)
             
-            if htable.is_valid():
-                bucket_array = obj.Object(theType="Array", targetType="Pointer", offset = htable.bucket_array, vm = htable.nbuckets.obj_vm, count = 64)
-       
-                for bucket_ptr in bucket_array:
-                    bucket = bucket_ptr.dereference_as("bucket_contents")
-                    while bucket.times_found > 0 and bucket.data.is_valid() and bucket.key.is_valid():  
-                        pdata = bucket.data 
+            for ent in htable:
+                yield ent            
 
-                        if pdata.path.is_valid() and (0 <= pdata.flags <= 2):
-                            yield bucket
-
-                        bucket = bucket.next
-        
             off = off + 1
 
     def ldrmodules(self):
@@ -1523,22 +1519,7 @@ class task_struct(obj.CType):
 
                 yield (key, val) 
 
-    def bash_environment(self):
-        # Are we dealing with 32 or 64-bit pointers
-        if self.obj_vm.profile.metadata.get('memory_model', '32bit') == '32bit':
-            pack_format = "<I"
-            addr_sz = 4
-        else:
-            pack_format = "<Q"
-            addr_sz = 8
-
-        proc_as = self.get_process_address_space()
-        
-        # In cases when mm is an invalid pointer 
-        if not proc_as:
-            return
-
-        procvars = []
+    def _dynamic_env(self, proc_as, pack_format, addr_sz):
         for vma in self.get_proc_maps():
             if not (vma.vm_file and str(vma.vm_flags) == "rw-"):
                 continue
@@ -1570,7 +1551,7 @@ class task_struct(obj.CType):
                         # single char name, =
                         if nullidx >= eqidx:
                             env_start = addr
-
+            
             if env_start == 0:
                 continue
 
@@ -1604,6 +1585,74 @@ class task_struct(obj.CType):
                     else:
                         break
 
+    def _shell_variables(self, proc_as, pack_format, addr_sz):
+        bash_was_last = False
+        for vma in self.get_proc_maps():
+            if vma.vm_file:
+                fname = vma.info(self)[0]
+       
+                if fname.endswith("/bin/bash"):
+                    bash_was_last = True
+                else:
+                    bash_was_last = False
+            
+            # we are looking for the bss of bash 
+            if vma.vm_file or str(vma.vm_flags) != "rw-":
+                continue
+            
+            # we are looking for the bss of bash 
+            if bash_was_last == False:
+                continue
+        
+            nbuckets_offset = self.obj_vm.profile.get_obj_offset("_bash_hash_table", "nbuckets") 
+
+            for off in range(vma.vm_start, vma.vm_end, 4):
+                ptr_test = proc_as.read(off, 4)
+                if not ptr_test:
+                    continue
+
+                ptr = struct.unpack(pack_format, ptr_test)[0]
+                
+                ptr_test2 = proc_as.read(ptr + 20, 4)
+                if not ptr_test2:
+                    continue
+
+                ptr2 = struct.unpack(pack_format, ptr_test2)[0]
+                
+                test = proc_as.read(ptr2 + 4, 4)
+                if not test or test != "\x40\x00\x00\x00":
+                    continue
+
+                htable = obj.Object("_bash_hash_table", offset = ptr2, vm = proc_as)
+                
+                for ent in htable:
+                    key = str(ent.key.dereference())    
+                    val = str(ent.data.dereference_as("_envdata").value.dereference())
+
+                    yield key, val
+
+            bash_was_last = False
+
+    def bash_environment(self):
+        proc_as = self.get_process_address_space()
+        
+        # In cases when mm is an invalid pointer 
+        if not proc_as:
+            return
+
+        # Are we dealing with 32 or 64-bit pointers
+        if self.obj_vm.profile.metadata.get('memory_model', '32bit') == '32bit':
+            pack_format = "<I"
+            addr_sz = 4
+        else:
+            pack_format = "<Q"
+            addr_sz = 8
+
+        for key, val in self._dynamic_env(proc_as, pack_format, addr_sz):
+            yield key, val        
+
+        for key, val in self._shell_variables(proc_as, pack_format, addr_sz):
+            yield key, val
 
     def lsof(self):
         fds = self.files.get_fds()
@@ -1721,7 +1770,7 @@ class task_struct(obj.CType):
         thread_offset = self.obj_vm.profile.get_obj_offset("task_struct", "thread_group")
         threads = [self]
         x = obj.Object('task_struct', self.thread_group.next.v() - thread_offset, self.obj_vm)
-        while x not in threads:
+        while x not in threads and x.thread_group.next.is_valid():
             threads.append(x)
             x = obj.Object('task_struct', x.thread_group.next.v() - thread_offset, self.obj_vm)
         return threads
@@ -1883,8 +1932,10 @@ class task_struct(obj.CType):
         This just figures out which is in use and returns the correct variables
         '''
 
-        wall_addr = self.obj_vm.profile.get_symbol("wall_to_monotonic")
-        sleep_addr = self.obj_vm.profile.get_symbol("total_sleep_time")
+        wall_addr       = self.obj_vm.profile.get_symbol("wall_to_monotonic")
+        sleep_addr      = self.obj_vm.profile.get_symbol("total_sleep_time")
+        timekeeper_addr = self.obj_vm.profile.get_symbol("timekeeper")
+        tkcore_addr     = self.obj_vm.profile.get_symbol("tk_core") 
 
         # old way
         if wall_addr and sleep_addr:
@@ -1896,11 +1947,32 @@ class task_struct(obj.CType):
             timeo = linux_common.vol_timespec(0, 0)
     
         # timekeeper way
-        else:
-            timekeeper_addr = self.obj_vm.profile.get_symbol("timekeeper")
+        elif timekeeper_addr:
             timekeeper = obj.Object("timekeeper", offset = timekeeper_addr, vm = self.obj_vm)
             wall = timekeeper.wall_to_monotonic
             timeo = timekeeper.total_sleep_time
+
+        # 3.17(ish) - 3.19(ish) way
+        elif tkcore_addr and hasattr("timekeeper", "total_sleep_time"):
+            # skip seqcount
+            timekeeper = obj.Object("timekeeper", offset = tkcore_addr + 4, vm = self.obj_vm)
+            wall = timekeeper.wall_to_monotonic
+            timeo = timekeeper.total_sleep_time
+
+        # 3.19(ish)+
+        # getboottime from 3.19.x
+        elif tkcore_addr:
+            # skip seqcount
+            timekeeper = obj.Object("timekeeper", offset = tkcore_addr + 8, vm = self.obj_vm)
+            wall = timekeeper.wall_to_monotonic
+
+            oreal = timekeeper.offs_real
+            oboot = timekeeper.offs_boot
+ 
+            tv64 = (oreal.tv64 & 0xffffffff) - (oboot.tv64 & 0xffffffff)
+
+            tv64 = (tv64 / 100000000) * -1
+            timeo = linux_common.vol_timespec(tv64, 0) 
 
         return (wall, timeo)
 
@@ -1922,22 +1994,27 @@ class task_struct(obj.CType):
             secs = secs - 1
 
         boot_time = secs + (nsecs / linux_common.nsecs_per / 100)
+
         return boot_time
         
     def get_task_start_time(self):
 
-        start_time = self.start_time
-        if type(start_time) == long:
-            start_secs = start_time
-        else: 
-            start_secs = start_time.tv_sec + (start_time.tv_nsec / linux_common.nsecs_per / 100)
+        if hasattr(self, "real_start_time"):
+            start_time = self.real_start_time
+        else:
+            start_time = self.start_time
+
+        if type(start_time) == volatility.obj.NativeType and type(start_time.v()) == long:
+            start_time = linux_common.vol_timespec(start_time.v() / 0x989680 / 100, 0)
+
+        start_secs = start_time.tv_sec + (start_time.tv_nsec / linux_common.nsecs_per / 100)
 
         sec = self.get_boot_time() + start_secs
-                
+               
         # convert the integer as little endian 
         try:
             data = struct.pack("<I", sec)
-        except struct.error:
+        except struct.error, e:
             # in case we exceed 0 <= number <= 4294967295
             return 0
 
@@ -1959,11 +2036,15 @@ class task_struct(obj.CType):
             if argv:
                 # split the \x00 buffer into args
                 env = " ".join(argv.split("\x00"))
+
             else:
                 env = ""
         else:
             # kernel thread
             env = ""
+
+        if len(env) > 1 and env[-1] == " ":
+            env = env[:-1]
 
         return env
 
@@ -1985,6 +2066,9 @@ class task_struct(obj.CType):
         else:
             # kernel thread
             name = "[" + self.comm + "]"
+    
+        if len(name) > 1 and name[-1] == " ":
+            name = name[:-1]
 
         return name
 
@@ -2092,28 +2176,32 @@ class VolatilityDTB(obj.VolatilityMagic):
         
         if profile.metadata.get('memory_model', '32bit') == "32bit":
             sym   = "swapper_pg_dir"
-            shift = 0xc0000000
+            shifts = [0xc0000000]
         else:
             sym   = "init_level4_pgt"
-            shift = 0xffffffff80000000
-        
-        sym_addr = profile.get_symbol(sym) - shift
+            shifts = [0xffffffff80000000, 0xffffffff80000000 - 0x1000000, 0xffffffff7fe00000]       
 
-        pas = self.obj_vm
+        good_dtb = -1
+ 
+        for shift in shifts:
+            sym_addr = profile.get_symbol(sym) - shift
 
-        init_task_addr = profile.get_symbol("init_task") 
-        offset         = profile.get_obj_offset("task_struct", "comm")
-   
-        read_addr = init_task_addr - shift + offset
+            pas = self.obj_vm
 
-        buf = pas.read(read_addr, 12)        
-      
-        if buf:
-            idx = buf.find("swapper")
-            if idx != 0:
-                sym_addr = sym_addr + 0x1000000
+            init_task_addr = profile.get_symbol("init_task") 
+            offset         = profile.get_obj_offset("task_struct", "comm")
+       
+            read_addr = init_task_addr - shift + offset
 
-        yield sym_addr
+            buf = pas.read(read_addr, 12)        
+          
+            if buf:
+                idx = buf.find("swapper")
+                if idx == 0:
+                    good_dtb = sym_addr
+                    break
+
+        yield good_dtb
 
 # the intel check, simply checks for the static paging of init_task
 class VolatilityLinuxIntelValidAS(obj.VolatilityMagic):
@@ -2124,19 +2212,20 @@ class VolatilityLinuxIntelValidAS(obj.VolatilityMagic):
         init_task_addr = self.obj_vm.profile.get_symbol("init_task")
 
         if self.obj_vm.profile.metadata.get('memory_model', '32bit') == "32bit":
-            shift = 0xc0000000
+            shifts = [0xc0000000]
         else:
-            shift = 0xffffffff80000000
+            shifts = [0xffffffff80000000, 0xffffffff80000000 - 0x1000000, 0xffffffff7fe00000]       
 
-        phys  = self.obj_vm.vtop(init_task_addr)
-        check = init_task_addr - shift
-        if phys == check:
-            yield True
-        elif phys == check + 0x1000000:
-            yield True
-        else:
-            yield False
+        ret = False
 
+        for shift in shifts:
+            phys  = self.obj_vm.vtop(init_task_addr)
+            check = init_task_addr - shift
+            if phys == check:
+                ret = True
+                break
+
+        yield ret
 
 # the ARM check, has to check multiple values b/c phones do not map RAM at 0
 class VolatilityLinuxARMValidAS(obj.VolatilityMagic):
@@ -2191,7 +2280,6 @@ class LinuxObjectClasses(obj.ProfileModification):
             'VolatilityLinuxARMValidAS' : VolatilityLinuxARMValidAS,
             'kernel_param' : kernel_param,
             'kparam_array' : kparam_array,
-            'gate_struct64' : gate_struct64,
             'desc_struct' : desc_struct,
             'page': page,
             'LinuxPermissionFlags': LinuxPermissionFlags,
@@ -2246,7 +2334,6 @@ class page(obj.CType):
         return phys_offset
 
 class mount(obj.CType):
-
     @property
     def mnt_sb(self):
 
@@ -2278,6 +2365,10 @@ class mount(obj.CType):
         return ret
 
 class vfsmount(obj.CType):
+    def is_valid(self):
+        return self.mnt_sb.is_valid() and \
+               self.mnt_root.is_valid() and \
+               self.mnt_parent.is_valid()
 
     def _get_real_mnt(self):
 
@@ -2313,5 +2404,18 @@ class LinuxMountOverlay(obj.ProfileModification):
 
         if profile.vtypes.get("mount"):
             profile.object_classes.update({'mount' : mount, 'vfsmount' : vfsmount})
+        else:
+            profile.object_classes.update({'vfsmount' : vfsmount})
+
+class LinuxGate64Overlay(obj.ProfileModification):
+    conditions = {'os': lambda x: x == 'linux'}
+    before = ['BasicObjectClasses'] # , 'LinuxVTypes']
+
+    def modification(self, profile):
+        if profile.has_type("gate_struct64"): 
+            profile.object_classes.update({'gate_struct64' : gate_struct64})
+
+
+
 
 

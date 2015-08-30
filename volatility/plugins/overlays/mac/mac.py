@@ -255,10 +255,11 @@ class vnode(obj.CType):
         phys_as = utils.load_as(self.obj_vm.get_config(), astype = 'physical')
         
         while cur and cur.is_valid() and cur.offset < file_size:
-            buf = phys_as.zread(cur.phys_page * 4096, 4096)              
+            if cur.offset > 0:
+                buf = phys_as.zread(cur.phys_page * 4096, 4096)              
 
-            yield (cur.offset.v(), buf)
- 
+                yield (cur.offset.v(), buf)
+     
             cur = cur.listq.next.dereference_as("vm_page")
 
 class fileglob(obj.CType):
@@ -268,8 +269,11 @@ class fileglob(obj.CType):
         ret = self.members.get("fg_type")
         if ret:
             ret = self.m("fg_type")
-        else:    
-            ret = self.fg_ops.fo_type
+        else:
+            if self.fg_ops.is_valid(): 
+                ret = self.fg_ops.fo_type
+            else:
+                ret = 'INVALID'
 
         ret = str(ret)
         return ret
@@ -346,8 +350,22 @@ class proc(obj.CType):
             htable_type     = "mac64_bash_hash_table"
             nbuckets_offset = self.obj_vm.profile.get_obj_offset(htable_type, "nbuckets") 
 
+        shared_start = self.task.shared_region.sr_base_address 
+        shared_end   = shared_start + self.task.shared_region.sr_size
+
         for map in self.get_proc_maps():
+            if shared_start <= map.start <= shared_end:
+                continue
+
+            if map.get_perms() != "rw-":
+                continue
+
             if map.get_path() != "":
+                continue
+
+            ## 1 GB limit to prevent major delays...the bash hash data
+            ## should not be found in a region larger than this. 
+            if map.end - map.start > 0x40000000:
                 continue
 
             off = map.start
@@ -422,14 +440,7 @@ class proc(obj.CType):
         for hist in sorted(history_entries, key = attrgetter('time_as_integer')):
             yield hist              
 
-    def bash_environment(self):
-        proc_as = self.get_process_address_space()
-        
-        # In cases when mm is an invalid pointer 
-        if not proc_as:
-            return
-        
-        procvars = []
+    def _dynamic_env(self, proc_as, pack_format, addr_sz):
         for mapping in self.get_proc_maps():
             if not str(mapping.get_perms()) == "rw-" or mapping.get_path().find("bash") == -1:
                 continue
@@ -489,6 +500,88 @@ class proc(obj.CType):
                     else:
                         break         
 
+    def _shell_variables(self, proc_as, pack_format, addr_sz, htable_type):
+        bash_was_last = False
+        
+        nbuckets_offset = self.obj_vm.profile.get_obj_offset(htable_type, "nbuckets") 
+
+        if addr_sz == 4:
+            skip_sz = 20
+            edata_type = "mac32_envdata"
+        else:
+            skip_sz = 32
+            edata_type = "mac64_envdata"
+
+        seen = {}
+
+        for vma in self.get_proc_maps():
+            if vma.get_perms() != "rw-" or vma.get_path().endswith("/bin/bash"):
+                continue
+            
+            off = vma.start
+            end = vma.end
+            while off < end:
+                ptr_test = proc_as.read(off, addr_sz)
+                if not ptr_test:
+                    off = ((off & ~0xfff) | 0xfff) + 1
+                    continue    
+                    
+                off = off + 1
+
+                ptr = struct.unpack(pack_format, ptr_test)[0]
+              
+                if ptr in seen:
+                    continue
+                else:
+                    seen[ptr] = 1
+ 
+                ptr_test2 = proc_as.read(ptr + skip_sz, addr_sz)
+                if not ptr_test2:
+                    continue
+
+                ptr2 = struct.unpack(pack_format, ptr_test2)[0]
+
+                test = proc_as.read(ptr2 + addr_sz, 4)
+                if not test or test != "\x40\x00\x00\x00":
+                    continue
+
+                htable = obj.Object(htable_type, offset = ptr2, vm = proc_as)
+            
+                for ent in htable:
+                    key = str(ent.key)    
+                    val_addr = ent.data.dereference_as(edata_type).value
+                    if val_addr.is_valid():
+                        val = str(val_addr.dereference())
+                    else:
+                        val = ""
+
+                    yield key, val
+
+            bash_was_last = False
+
+    def bash_environment(self):
+        proc_as = self.get_process_address_space()
+        
+        # In cases when mm is an invalid pointer 
+        if not proc_as:
+            return
+
+        # Are we dealing with 32 or 64-bit pointers
+        if self.obj_vm.profile.metadata.get('memory_model', '32bit') == '32bit':
+            pack_format = "<I"
+            addr_sz = 4
+            htable_type = "mac32_bash_hash_table"
+        else:
+            pack_format = "<Q"
+            addr_sz = 8
+            htable_type = "mac64_bash_hash_table"
+
+        for key, val in self._dynamic_env(proc_as, pack_format, addr_sz):
+            yield key, val        
+
+        for key, val in self._shell_variables(proc_as, pack_format, addr_sz, htable_type):
+            yield key, val
+
     def netstat(self):
         for (filp, _, _) in self.lsof():
             if filp.f_fglob.fg_type == 'DTYPE_SOCKET':
@@ -540,9 +633,10 @@ class proc(obj.CType):
         seen_threads = []
         qentry = self.task.threads
         for thread in qentry.thread_walk_list(qentry.obj_offset):
-            if thread.obj_offset not in seen_threads:
-                seen_threads.append(thread.obj_offset)
-                threads.append(thread)
+            if thread.obj_offset in seen_threads:
+                break
+            seen_threads.append(thread.obj_offset)
+            threads.append(thread)
 
         return threads 
 
@@ -675,7 +769,10 @@ class proc(obj.CType):
 
     def get_dyld_maps(self):        
         proc_as = self.get_process_address_space()
-
+    
+        if proc_as == None:
+            return
+    
         if self.pack_size == 4:
             dtype = "dyld32_all_image_infos"
             itype = "dyld32_image_info"
@@ -891,7 +988,7 @@ class proc(obj.CType):
                     vnode = f.f_fglob.fg_data.dereference_as("vnode")
                     path = vnode.full_path()
                 else:
-                    path = ""
+                    path = "<%s>" % ftype.replace("DTYPE_", "").lower()
                         
                 yield f, path, i
 
@@ -1072,6 +1169,9 @@ class sysctl_oid(obj.CType):
 class OSString(obj.CType):
     def __str__(self):
         if self.string == 0:
+            return ""
+
+        if self.length > 4096:
             return ""
 
         string_object = obj.Object("String", offset = self.string, vm = self.obj_vm, length = self.length)
@@ -1357,7 +1457,7 @@ class dyld32_image_info(obj.CType):
         if addr == None:
             return ""
 
-        buf = self.obj_vm.read(addr, 256)
+        buf = self.obj_vm.zread(addr, 256)
         if buf:
             idx = buf.find("\x00")
             if idx != -1:
@@ -1389,7 +1489,7 @@ class dyld64_image_info(obj.CType):
         if addr == None:
             return ""
 
-        buf = self.obj_vm.read(addr, 256)
+        buf = self.obj_vm.zread(addr, 256)
         if buf:
             idx = buf.find("\x00")
             if idx != -1:
@@ -1847,12 +1947,6 @@ mac_overlay = {
         }], 
     'sysctl_oid' : [ None, { 
         'oid_name' : [ None, ['pointer', ['String', dict(length = 256)]]], 
-        }], 
-    'dyld32_image_info' : [ None, { 
-        'imageFilePath' : [ None, ['pointer', ['String', dict(length = 256)]]], 
-        }], 
-    'dyld64_image_info' : [ None, { 
-        'imageFilePath' : [ None, ['pointer', ['String', dict(length = 256)]]], 
         }], 
     'sockaddr_un': [ None, { 
         'sun_path' : [ None, ['String', dict(length = 104)]],
