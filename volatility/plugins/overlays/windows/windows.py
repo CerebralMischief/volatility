@@ -793,6 +793,13 @@ class _HANDLE_TABLE(obj.CType):
         yielding all handles. We take care of recursing into the
         nested tables automatically.
         """
+
+        magic = obj.VolMagic(self.obj_vm)
+        if hasattr(magic, 'ObHeaderCookie'):
+            cookie = magic.ObHeaderCookie.v()
+            if not cookie:
+                raise StopIteration("Cannot find nt!ObHeaderCookie")
+
         # This should work equally for 32 and 64 bit systems
         LEVEL_MASK = 7
 
@@ -1002,11 +1009,13 @@ class _CM_KEY_BODY(obj.CType):
     def full_key_name(self):
         output = []
         kcb = self.KeyControlBlock
-        while kcb.ParentKcb:
+        seen = []
+        while kcb.ParentKcb and kcb.ParentKcb.obj_offset not in seen:
             if kcb.NameBlock.Name == None:
                 break
             output.append(str(kcb.NameBlock.Name))
             kcb = kcb.ParentKcb
+            seen.append(kcb.obj_offset)
         return "\\".join(reversed(output))
 
 class _CMHIVE(obj.CType):

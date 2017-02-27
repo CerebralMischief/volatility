@@ -101,6 +101,7 @@ class Win2003x64DTB(obj.ProfileModification):
 
     def modification(self, profile):
         overlay = {'VOLATILITY_MAGIC': [ None, {
+                        'KPCR' : [ None, ['VolatilityKPCR', dict(configname = "KPCR")]],
                         'DTBSignature': [ None, ['VolatilityMagic', dict(value = "\x03\x00\x2e\x00")]]}
                                         ]}
         profile.merge_overlay(overlay)
@@ -132,6 +133,7 @@ class Win2003SP0x86(obj.Profile):
     _md_build = 3789
     _md_memory_model = '32bit'
     _md_vtype_module = 'volatility.plugins.overlays.windows.win2003_sp0_x86_vtypes'
+    _md_product = ["NtProductLanManNt", "NtProductServer"]
 
 class Win2003SP1x86(obj.Profile):
     """ A Profile for Windows 2003 SP1 x86 """
@@ -141,6 +143,7 @@ class Win2003SP1x86(obj.Profile):
     _md_build = 3790
     _md_memory_model = '32bit'
     _md_vtype_module = 'volatility.plugins.overlays.windows.win2003_sp1_x86_vtypes'
+    _md_product = ["NtProductLanManNt", "NtProductServer"]
 
 class Win2003SP2x86(obj.Profile):
     """ A Profile for Windows 2003 SP2 x86 """
@@ -151,6 +154,7 @@ class Win2003SP2x86(obj.Profile):
     _md_build = 3791 
     _md_memory_model = '32bit'
     _md_vtype_module = 'volatility.plugins.overlays.windows.win2003_sp2_x86_vtypes'
+    _md_product = ["NtProductLanManNt", "NtProductServer"]
 
 class Win2003SP1x64(obj.Profile):
     """ A Profile for Windows 2003 SP1 x64 """
@@ -160,6 +164,7 @@ class Win2003SP1x64(obj.Profile):
     _md_minor = 2
     _md_build = 3790
     _md_vtype_module = 'volatility.plugins.overlays.windows.win2003_sp1_x64_vtypes'
+    _md_product = ["NtProductLanManNt", "NtProductServer"]
 
 class Win2003SP2x64(obj.Profile):
     """ A Profile for Windows 2003 SP2 x64 """
@@ -170,10 +175,13 @@ class Win2003SP2x64(obj.Profile):
     # This is a fake build number. See the comment in Win2003SP0x86
     _md_build = 3791
     _md_vtype_module = 'volatility.plugins.overlays.windows.win2003_sp2_x64_vtypes'
+    _md_product = ["NtProductLanManNt", "NtProductServer"]
 
 class WinXPSP1x64(Win2003SP1x64):
     """ A Profile for Windows XP SP1 x64 """
+    _md_product = ["NtProductWinNt"]
 
 class WinXPSP2x64(Win2003SP2x64):
     """ A Profile for Windows XP SP2 x64 """
+    _md_product = ["NtProductWinNt"]
 

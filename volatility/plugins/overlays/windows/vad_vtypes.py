@@ -140,7 +140,7 @@ class VadTagModification(obj.ProfileModification):
                 '_MM_AVL_NODE': [ None, {
                     'Tag': [offset , ['String', dict(length = 4)]],
                 }]})
-        elif version == (6, 3):
+        elif version >= (6, 3):
             overlay.update({
                 '_RTL_BALANCED_NODE': [ None, {
                     'Tag': [offset , ['String', dict(length = 4)]],
@@ -397,6 +397,7 @@ class Win8Vad(obj.ProfileModification):
                   "minor": lambda x: x == 2}
 
     def modification(self, profile):
+    
         profile.object_classes.update({
             '_MMVAD': _MMVAD_WIN8,
             '_MMVAD_SHORT': _MMVAD_SHORT_WIN8,
@@ -447,7 +448,7 @@ class _MMVAD_SHORT_WIN81(_RTL_BALANCED_NODE):
     @property
     def End(self):
         return ((self.EndingVpn + 1) << 12) - 1
-
+        
     @property
     def VadFlags(self):
         return self.u.VadFlags
@@ -467,6 +468,16 @@ class _MMVAD_SHORT_WIN81(_RTL_BALANCED_NODE):
     @property
     def RightChild(self):
         return self.VadNode.Right
+
+class _MMVAD_SHORT_WIN81_64(_MMVAD_SHORT_WIN81):
+
+    @property
+    def Start(self):
+        return (self.StartingVpn << 12) | (self.StartingVpnHigh << 44)
+
+    @property
+    def End(self):
+        return (((self.EndingVpn + 1) << 12) | (self.EndingVpnHigh << 44)) - 1
 
 class _MMVAD_WIN81(_MMVAD_SHORT_WIN81):
 
@@ -515,12 +526,19 @@ class Win81Vad(obj.ProfileModification):
     before = ["WindowsOverlay"]
     conditions = {"os": lambda x: x == "windows", 
                   "major": lambda x: x == 6, 
-                  "minor": lambda x: x == 3}
+                  "minor": lambda x: x >= 3}
 
     def modification(self, profile):
+    
+        if profile.metadata.get("memory_model") == "32bit":
+            short_vad = _MMVAD_SHORT_WIN81
+        else:
+            short_vad = _MMVAD_SHORT_WIN81_64
+    
         profile.object_classes.update({
             '_MMVAD': _MMVAD_WIN81,
-            '_MMVAD_SHORT': _MMVAD_SHORT_WIN81,
+            '_MMVAD_SHORT': short_vad,
             '_RTL_AVL_TREE': _RTL_AVL_TREE,
             '_RTL_BALANCED_NODE': _RTL_BALANCED_NODE,
             })
+
